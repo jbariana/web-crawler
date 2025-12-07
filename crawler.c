@@ -10,20 +10,12 @@ will write basic CLI and structures, you guys can edit it if you like */
 
 #define MaxUrlLength 512 //maximum length of a URL,you guys can adjust as needed
 
-//structure to represent the URLNode in the path
-typedef struct UrlNode {
-    char url[MaxUrlLength];
-    int depth;
-    struct UrlNode* parent; //pointer to the parent UrlNode
-    struct UrlNode* next; //pointer to the next UrlNode in the queue 
-
-} UrlNode;
 
 //structure for URL queue
 
 typedef struct {
     UrlNode *head;
-    urlNode *tail;
+    UrlNode *tail;
     int size;
     pthread_mutex_t lock;
     pthread_cond_t cond;
