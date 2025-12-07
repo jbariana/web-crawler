@@ -10,9 +10,7 @@ will write basic CLI and structures, you guys can edit it if you like */
 
 #define MaxUrlLength 512 //maximum length of a URL,you guys can adjust as needed
 
-
 //structure for URL queue
-
 typedef struct {
     UrlNode *head;
     UrlNode *tail;
@@ -51,15 +49,6 @@ typedef struct {
     size_t size;
 } HttpResponse;
 
-
-
-
-
-
-
-
-
-
 //show the help message 
 void help_message(){
     printf("Usage: crawler <start_url> <finish_url> <depth>\n");
@@ -80,17 +69,6 @@ int main(int argc, char *argv[])
         help_message();
         return 1;
     }
-
-
-
-
-
-
-
-
-
-    
-
 
     return 0;
 }
