@@ -120,6 +120,35 @@ HttpResponse fetch_url(const char *url)
     return response;
 }
 
+//parses Wikipedia HTML and finds internal /wiki/... URLs
+//creates a new URL node for each link found and adds it to a linked list
+void extract_links(const char *html, UrlNode **head) {
+    const char *p = html;
+
+    //loop through the HTML, finding each "/wiki/..." link
+    while ((p = strstr(p, "<a href=\"/wiki/")) != NULL) {
+        p += strlen("<a href=\"");                     //move pointer past the "<a href="
+
+        const char *end = strchr(p, '"');           //find the closing quote of the URL
+        if (!end) break;                                 //stop if malformed
+
+        size_t len = end - p;                            //calculate length of URL
+        if (len >= MaxUrlLength) len = MaxUrlLength - 1; //enforce max length
+
+        //allocate a new URL node and copy the URL into it
+        UrlNode *node = malloc(sizeof(UrlNode));
+        strncpy(node->url, p, len);
+        node->url[len] = '\0';
+
+        //insert the new node at the head of the linked list
+        node->next = *head;
+        *head = node;
+
+        // continue searching after this link
+        p = end;
+    }
+}
+
 //main function
 int main(int argc, char *argv[])
 {
