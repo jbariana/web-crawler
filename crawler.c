@@ -14,7 +14,6 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
-#include <curl/curl.h> // libcurl
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -47,33 +46,20 @@ size_t write_callback(void* ptr, size_t size, size_t nmemb, void* userdata) {
     return total;
 }
 
+// Demo version of fetch_url for presentation
 HttpResponse fetch_url(const char* url)
 {
-    CURL* curl;
-    CURLcode res;
     HttpResponse response;
-    response.data = NULL;
-    response.size = 0;
 
-    curl = curl_easy_init();
-    if (!curl) {
-        fprintf(stderr, "Failed to initialize curl\n");
-        return response;
-    }
+    // fake HTML with a few internal links
+    const char* fake_html = "<a href=\"/wiki/Test1\">Test1</a>"
+        "<a href=\"/wiki/Test2\">Test2</a>";
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "crawler-demo/1.0");
+    // allocate memory for the fake HTML
+    response.size = strlen(fake_html);
+    response.data = malloc(response.size + 1);
+    strcpy(response.data, fake_html);
 
-    res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        fprintf(stderr, "curl error for %s: %s\n", url, curl_easy_strerror(res));
-    }
-
-    curl_easy_cleanup(curl);
     return response;
 }
 
