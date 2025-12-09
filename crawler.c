@@ -1,161 +1,131 @@
-﻿/* crawler.c
- * Minimal single-threaded BFS web crawler for presentation (Option A)
- *
- * Usage:
- *   ./crawler <start_url> <finish_url> <max_depth>
- *
- * Notes:
- *  - Uses libcurl (fetch_url)
- *  - extract_links currently finds "/wiki/..." links (keeps your original)
- *  - Converts relative links (starting with '/') to absolute using start URL origin
- *  - Simple visited set (hash table)
- *  - Simple queue for BFS using UrlNode from path.h
- */
-
-#define _POSIX_C_SOURCE 200809L
+﻿#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-#include <unistd.h>
-#include "path.h" // UrlNode and Path_print
+#include <curl/curl.h>
+#include <ctype.h>
+#include <errno.h>
+#include "path.h" // provides UrlNode and MaxUrlLength
 
-#define MaxUrlLength 512
-#define VISITED_BUCKETS 1000
-#define MAX_PAGES_VISIT 1000
+/* Tunable */
+#define VISITED_BUCKETS 8192
+#define DEFAULT_THREADS 4
+#define DEFAULT_MAX_PAGES 10000
 
- /* ------------------------ Provided HTTP fetch + parsing helpers ------------------------ */
-
- /* HttpResponse and write_callback - same logic you supplied */
+/* --------------------- HTTP helper --------------------- */
 typedef struct {
-    char* data;
+    char *data;
     size_t size;
 } HttpResponse;
 
-size_t write_callback(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    HttpResponse* resp = (HttpResponse*)userdata;
+static size_t write_callback(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    HttpResponse *resp = (HttpResponse*)userdata;
     size_t total = size * nmemb;
-    char* new_data = realloc(resp->data, resp->size + total + 1); // +1 for null terminator
-    if (!new_data) {
-        return 0;
-    }
-    resp->data = new_data;
+    char *newbuf = realloc(resp->data, resp->size + total + 1);
+    if (!newbuf) return 0; // make curl fail
+    resp->data = newbuf;
     memcpy(resp->data + resp->size, ptr, total);
     resp->size += total;
-    resp->data[resp->size] = '\0'; // keep data null-terminated
+    resp->data[resp->size] = '\0';
     return total;
 }
 
-// Demo version of fetch_url for presentation
-HttpResponse fetch_url(const char* url)
-{
-    HttpResponse response;
-
-    // fake HTML with a few internal links
-    const char* fake_html = "<a href=\"/wiki/Test1\">Test1</a>"
-        "<a href=\"/wiki/Test2\">Test2</a>";
-
-    // allocate memory for the fake HTML
-    response.size = strlen(fake_html);
-    response.data = malloc(response.size + 1);
-    strcpy(response.data, fake_html);
-
-    return response;
+static HttpResponse fetch_url_curl(const char *url, CURL *easy) {
+    HttpResponse resp = { .data = NULL, .size = 0 };
+    curl_easy_reset(easy);
+    curl_easy_setopt(easy, CURLOPT_URL, url);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "wiki-crawler/1.0");
+    CURLcode rc = curl_easy_perform(easy);
+    if (rc != CURLE_OK) {
+        fprintf(stderr, "[curl error] %s -> %s\n", url, curl_easy_strerror(rc));
+        if (resp.data) { free(resp.data); resp.data = NULL; resp.size = 0; }
+    }
+    return resp;
 }
 
-/* extract_links - your original simple wiki-style parser
- * It pushes relative "/wiki/..." (and potentially absolute) into a linked list head.
- * The returned nodes contain node->url set to the found href (as discovered).
- * We will later normalize to full URLs.
- */
-void extract_links(const char* html, UrlNode** head) {
+/* --------------------- Basic HTML link extractor ---------------------
+   Very simple: looks for href="/wiki/..." or full absolute URLs containing "/wiki/".
+   Returns a temporary linked list of UrlNode (caller must free via free_temp_links).
+--------------------------------------------------------------------- */
+void extract_links(const char *html, UrlNode **head) {
     if (!html) return;
-    const char* p = html;
-    while ((p = strstr(p, "<a href=\"/wiki/")) != NULL) {
-        p += strlen("<a href=\""); // move past <a href="
-        const char* end = strchr(p, '"');
-        if (!end) break;
-        size_t len = end - p;
-        if (len >= MaxUrlLength) len = MaxUrlLength - 1;
+    const char *p = html;
+    while ((p = strstr(p, "href=")) != NULL) {
+        p += 5;
+        while (*p && isspace((unsigned char)*p)) p++;
+        char q = '\0';
+        if (*p == '"' || *p == '\'') { q = *p; p++; }
 
-        UrlNode* node = malloc(sizeof(UrlNode));
-        if (!node) break;
-        strncpy(node->url, p, len);
-        node->url[len] = '\0';
-        node->parent = NULL;
-        node->depth = 0;
-        node->next = *head;
-        *head = node;
+        const char *href = p;
+        const char *end = NULL;
+        if (q) end = strchr(href, q);
+        else {
+            end = href;
+            while (*end && *end != ' ' && *end != '>') end++;
+        }
+        if (!end) break;
+        size_t len = end - href;
+        if (len == 0) { p = end; continue; }
+
+        /* Only accept links that contain /wiki/ near the start or absolute with /wiki/ */
+        if ((href[0] == '/' && strncmp(href, "/wiki/", 6) == 0) ||
+            (strncmp(href, "http://", 7) == 0 || strncmp(href, "https://", 8) == 0)) {
+            /* if absolute, ensure /wiki/ appears */
+            if (!(href[0] == '/' || strstr(href, "/wiki/"))) { p = end; continue; }
+
+            size_t copy_len = len < MaxUrlLength-1 ? len : MaxUrlLength-1;
+            UrlNode *n = malloc(sizeof(UrlNode));
+            if (!n) break;
+            memset(n, 0, sizeof(UrlNode));
+            strncpy(n->url, href, copy_len);
+            n->url[copy_len] = '\0';
+            n->depth = 0;
+            n->parent = NULL;
+            n->next = *head;
+            *head = n;
+        }
         p = end;
     }
 }
 
-/* ------------------------ Queue implementation (UrlQueue) ------------------------ */
-
-typedef struct {
-    UrlNode* head;
-    UrlNode* tail;
-    int size;
-} SimpleUrlQueue;
-
-void queue_init(SimpleUrlQueue* q) {
-    q->head = q->tail = NULL;
-    q->size = 0;
-}
-
-int queue_is_empty(SimpleUrlQueue* q) {
-    return q->size == 0;
-}
-
-void queue_push(SimpleUrlQueue* q, UrlNode* node) {
-    node->next = NULL;
-    if (q->tail == NULL) {
-        q->head = q->tail = node;
+void free_temp_links(UrlNode *head) {
+    while (head) {
+        UrlNode *t = head;
+        head = head->next;
+        free(t);
     }
-    else {
-        q->tail->next = node;
-        q->tail = node;
-    }
-    q->size++;
 }
 
-UrlNode* queue_pop(SimpleUrlQueue* q) {
-    if (q->head == NULL) return NULL;
-    UrlNode* node = q->head;
-    q->head = node->next;
-    if (q->head == NULL) q->tail = NULL;
-    node->next = NULL; // detach
-    q->size--;
-    return node;
-}
-
-/* ------------------------ Visited set (simple hash table) ------------------------ */
-
-typedef struct VisitedNode {
+/* --------------------- Visited set (simple hashtable) --------------------- */
+typedef struct VisNode {
     char url[MaxUrlLength];
-    struct VisitedNode* next;
-} VisitedNode;
+    struct VisNode *next;
+} VisNode;
 
 typedef struct {
-    VisitedNode* buckets[VISITED_BUCKETS];
+    VisNode *buckets[VISITED_BUCKETS];
+    pthread_mutex_t lock;
 } VisitedSet;
 
-/* djb2 hash */
-static unsigned long djb2(const char* str) {
-    unsigned long hash = 5381;
+static unsigned long djb2(const char *s) {
+    unsigned long h = 5381;
     int c;
-    while ((c = (unsigned char)*str++))
-        hash = ((hash << 5) + hash) + c;
-    return hash;
+    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) + c;
+    return h;
 }
 
-void visited_init(VisitedSet* vs) {
-    for (int i = 0; i < VISITED_BUCKETS; i++) vs->buckets[i] = NULL;
+void visited_init(VisitedSet *vs) {
+    for (int i = 0; i < VISITED_BUCKETS; ++i) vs->buckets[i] = NULL;
+    pthread_mutex_init(&vs->lock, NULL);
 }
 
-int visited_contains(VisitedSet* vs, const char* url) {
-    unsigned long h = djb2(url) % VISITED_BUCKETS;
-    VisitedNode* cur = vs->buckets[h];
+int visited_contains_locked(VisitedSet *vs, const char *url) {
+    unsigned long idx = djb2(url) % VISITED_BUCKETS;
+    VisNode *cur = vs->buckets[idx];
     while (cur) {
         if (strcmp(cur->url, url) == 0) return 1;
         cur = cur->next;
@@ -163,216 +133,429 @@ int visited_contains(VisitedSet* vs, const char* url) {
     return 0;
 }
 
-void visited_insert(VisitedSet* vs, const char* url) {
-    if (visited_contains(vs, url)) return;
-    unsigned long h = djb2(url) % VISITED_BUCKETS;
-    VisitedNode* node = malloc(sizeof(VisitedNode));
-    if (!node) return;
-    strncpy(node->url, url, MaxUrlLength - 1);
-    node->url[MaxUrlLength - 1] = '\0';
-    node->next = vs->buckets[h];
-    vs->buckets[h] = node;
+int visited_contains(VisitedSet *vs, const char *url) {
+    pthread_mutex_lock(&vs->lock);
+    int res = visited_contains_locked(vs, url);
+    pthread_mutex_unlock(&vs->lock);
+    return res;
 }
 
-/* ------------------------ URL utility: extract origin (scheme + host) ------------------------ */
-
-/* Given "https://en.wikipedia.org/wiki/Apple" -> produce "https://en.wikipedia.org" */
-void get_origin(const char* url, char* out_origin, size_t out_size) {
-    // Find "://" then the next '/' after host
-    const char* p = strstr(url, "://");
-    if (!p) {
-        // fallback: treat whole url as origin up to first '/'
-        const char* s = strchr(url, '/');
-        if (!s) {
-            strncpy(out_origin, url, out_size - 1);
-            out_origin[out_size - 1] = '\0';
-            return;
-        }
-        else {
-            size_t len = s - url;
-            if (len >= out_size) len = out_size - 1;
-            strncpy(out_origin, url, len);
-            out_origin[len] = '\0';
-            return;
-        }
-    }
-    p += 3; // move past ://
-    const char* slash = strchr(p, '/');
-    size_t len;
-    if (!slash) {
-        len = strlen(url);
-    }
-    else {
-        len = slash - url;
-    }
-    if (len >= out_size) len = out_size - 1;
-    strncpy(out_origin, url, len);
-    out_origin[len] = '\0';
+void visited_insert(VisitedSet *vs, const char *url) {
+    if (!url) return;
+    pthread_mutex_lock(&vs->lock);
+    if (visited_contains_locked(vs, url)) { pthread_mutex_unlock(&vs->lock); return; }
+    unsigned long idx = djb2(url) % VISITED_BUCKETS;
+    VisNode *node = malloc(sizeof(VisNode));
+    if (!node) { pthread_mutex_unlock(&vs->lock); return; }
+    strncpy(node->url, url, MaxUrlLength-1);
+    node->url[MaxUrlLength-1] = '\0';
+    node->next = vs->buckets[idx];
+    vs->buckets[idx] = node;
+    pthread_mutex_unlock(&vs->lock);
 }
 
-/* Build absolute url: if link starts with '/', prefix origin; otherwise copy link */
-void build_full_url(const char* origin, const char* link, char* out, size_t out_size) {
+/* --------------------- Thread-safe queue --------------------- */
+typedef struct {
+    UrlNode *head;
+    UrlNode *tail;
+    int size;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} UrlQueue;
+
+void queue_init(UrlQueue *q) {
+    q->head = q->tail = NULL;
+    q->size = 0;
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->cond, NULL);
+}
+
+void queue_push(UrlQueue *q, UrlNode *n) {
+    n->next = NULL;
+    pthread_mutex_lock(&q->lock);
+    if (q->tail == NULL) q->head = q->tail = n;
+    else { q->tail->next = n; q->tail = n; }
+    q->size++;
+    pthread_cond_signal(&q->cond);
+    pthread_mutex_unlock(&q->lock);
+}
+
+/* Wait for an item or until should_stop becomes non-zero. Returns a node (caller must free or use). */
+UrlNode *queue_pop_wait(UrlQueue *q, int *should_stop) {
+    pthread_mutex_lock(&q->lock);
+    while (q->head == NULL && !*should_stop) {
+        pthread_cond_wait(&q->cond, &q->lock);
+    }
+    UrlNode *n = NULL;
+    if (q->head) {
+        n = q->head;
+        q->head = n->next;
+        if (q->head == NULL) q->tail = NULL;
+        n->next = NULL;
+        q->size--;
+    }
+    pthread_mutex_unlock(&q->lock);
+    return n;
+}
+
+/* --------------------- URL utilities --------------------- */
+/* Build absolute URL: if link starts with '/', prefix origin; otherwise copy link */
+void build_full_url(const char *origin, const char *link, char *out, size_t out_size) {
+    if (!link || !out) return;
     if (link[0] == '/') {
-        // join origin + link
         size_t olen = strlen(origin);
         size_t llen = strlen(link);
         if (olen + llen >= out_size) {
-            // truncate
-            size_t copy_len = out_size - 1;
-            strncpy(out, origin, copy_len);
-            out[copy_len] = '\0';
+            strncpy(out, origin, out_size-1);
+            out[out_size-1] = '\0';
             return;
         }
         strcpy(out, origin);
         strcat(out, link);
-    }
-    else {
-        // copy link directly (may be absolute already)
+    } else {
         strncpy(out, link, out_size - 1);
         out[out_size - 1] = '\0';
     }
 }
 
-/* Free a linked list of UrlNode used by extract_links (these were temporary) */
-void free_temp_links(UrlNode* head) {
-    while (head) {
-        UrlNode* tmp = head;
-        head = head->next;
-        free(tmp);
+/* Remove query and fragment in-place */
+void strip_query_fragment(char *s) {
+    char *p = s;
+    while (*p) {
+        if (*p == '#' || *p == '?') { *p = '\0'; return; }
+        p++;
     }
 }
 
-/* ------------------------ Help message ------------------------ */
-void help_message() {
-    printf("Usage: crawler <start_url> <finish_url> <depth>\n");
-    printf("Example: ./crawler https://en.wikipedia.org/wiki/Apple https://en.wikipedia.org/wiki/Orange 3\n");
+/* Extract wiki title (text after /wiki/). Returns 1 if found. */
+int wiki_title_from_url(const char *url, char *out, size_t out_size) {
+    const char *p = strstr(url, "/wiki/");
+    if (!p) return 0;
+    p += 6;
+    size_t i = 0;
+    while (*p && *p != '#' && *p != '?' && i + 1 < out_size) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return i > 0;
 }
 
-/* ------------------------ BFS crawler (single-threaded) ------------------------ */
+/* Canonicalize: strip query/fragment and trailing slash */
+void canonicalize_url(char *buf) {
+    strip_query_fragment(buf);
+    size_t n = strlen(buf);
+    if (n > 1 && buf[n-1] == '/') buf[n-1] = '\0';
+}
 
-int main(int argc, char* argv[])
-{
-    if (argc == 2 && strcmp(argv[1], "-h") == 0) {
-        help_message();
-        return 0;
-    }
-    if (argc != 4) {
-        fprintf(stderr, "Error: Invalid number of arguments.\n");
-        help_message();
-        return 1;
-    }
-
-    const char* start_url = argv[1];
-    const char* finish_url = argv[2];
-    int max_depth = atoi(argv[3]);
-    if (max_depth < 0) max_depth = 0;
-
-    // origin for building absolute links from relative ones
-    char origin[MaxUrlLength];
-    get_origin(start_url, origin, sizeof(origin));
-
-    // Initialize queue and visited
-    SimpleUrlQueue queue;
-    queue_init(&queue);
+/* --------------------- Controller & state --------------------- */
+typedef struct {
+    UrlQueue queue;
     VisitedSet visited;
-    visited_init(&visited);
+    char origin[MaxUrlLength];      /* e.g. https://en.wikipedia.org */
+    char target_title[MaxUrlLength];/* title extracted from finish URL */
+    int max_depth;
+    int max_pages;
+    int pages_visited;
+    pthread_mutex_t pages_lock;
 
-    // create start node
-    UrlNode* start = malloc(sizeof(UrlNode));
-    if (!start) {
-        fprintf(stderr, "Memory allocation failed for start node\n");
-        return 1;
+    int found;
+    UrlNode *found_node;
+    pthread_mutex_t found_lock;
+
+    int should_stop;
+    pthread_mutex_t stop_lock;
+
+    int active; /* number of threads currently processing a node */
+    pthread_mutex_t active_lock;
+} Controller;
+
+static Controller ctrl;
+
+void set_stop_flag(int v) {
+    pthread_mutex_lock(&ctrl.stop_lock);
+    ctrl.should_stop = v;
+    pthread_mutex_unlock(&ctrl.stop_lock);
+    /* wake all waiting workers */
+    pthread_mutex_lock(&ctrl.queue.lock);
+    pthread_cond_broadcast(&ctrl.queue.cond);
+    pthread_mutex_unlock(&ctrl.queue.lock);
+}
+
+int get_stop_flag(void) {
+    int v;
+    pthread_mutex_lock(&ctrl.stop_lock);
+    v = ctrl.should_stop;
+    pthread_mutex_unlock(&ctrl.stop_lock);
+    return v;
+}
+
+void mark_found(UrlNode *node) {
+    pthread_mutex_lock(&ctrl.found_lock);
+    ctrl.found = 1;
+    ctrl.found_node = node;
+    pthread_mutex_unlock(&ctrl.found_lock);
+    set_stop_flag(1);
+}
+
+int increment_pages_visited(void) {
+    pthread_mutex_lock(&ctrl.pages_lock);
+    ctrl.pages_visited++;
+    int v = ctrl.pages_visited;
+    pthread_mutex_unlock(&ctrl.pages_lock);
+    return v;
+}
+
+/* --------------------- Worker thread --------------------- */
+void *worker_main(void *arg) {
+    (void)arg;
+    CURL *easy = curl_easy_init();
+    if (!easy) {
+        fprintf(stderr, "[thread] curl_easy_init failed\n");
+        return NULL;
     }
-    strncpy(start->url, start_url, MaxUrlLength - 1);
-    start->url[MaxUrlLength - 1] = '\0';
-    start->depth = 0;
-    start->parent = NULL;
-    start->next = NULL;
 
-    queue_push(&queue, start);
-    visited_insert(&visited, start->url);
-
-    int pages_visited = 0;
-    UrlNode* found_node = NULL;
-
-    while (!queue_is_empty(&queue) && pages_visited < MAX_PAGES_VISIT) {
-        UrlNode* cur = queue_pop(&queue);
-        if (!cur) break;
-
-        // skip nodes deeper than allowed
-        if (cur->depth > max_depth) {
-            free(cur);
+    while (!get_stop_flag()) {
+        UrlNode *cur = queue_pop_wait(&ctrl.queue, &ctrl.should_stop);
+        if (!cur) {
+            if (get_stop_flag()) break;
             continue;
         }
 
-        pages_visited++;
+        /* Book the active slot */
+        pthread_mutex_lock(&ctrl.active_lock);
+        ctrl.active++;
+        pthread_mutex_unlock(&ctrl.active_lock);
 
-        // Check if this is the finish URL (exact match)
-        if (strcmp(cur->url, finish_url) == 0) {
-            found_node = cur;
+        /* skip over-depth nodes */
+        if (cur->depth > ctrl.max_depth) {
+            pthread_mutex_lock(&ctrl.active_lock);
+            ctrl.active--;
+            /* if queue empty and no active, stop */
+            pthread_mutex_lock(&ctrl.queue.lock);
+            int empty = (ctrl.queue.head == NULL);
+            pthread_mutex_unlock(&ctrl.queue.lock);
+            if (empty && ctrl.active == 0) set_stop_flag(1);
+            pthread_mutex_unlock(&ctrl.active_lock);
+            continue;
+        }
+
+        int pv = increment_pages_visited();
+        if (pv > ctrl.max_pages) {
+            set_stop_flag(1);
+            /* release active */
+            pthread_mutex_lock(&ctrl.active_lock);
+            ctrl.active--;
+            pthread_mutex_unlock(&ctrl.active_lock);
             break;
         }
 
-        // Fetch the page
-        HttpResponse resp = fetch_url(cur->url);
-        if (resp.data == NULL || resp.size == 0) {
-            // nothing fetched; continue
-            free(resp.data);
-            // do not free cur yet — we can free now since children already enqueued will hold parents
-            free(cur);
+        /* quick local print log */
+        fprintf(stderr, "[visit %d] %s (depth %d)\n", pv, cur->url, cur->depth);
+
+        /* fetch page */
+        HttpResponse resp = fetch_url_curl(cur->url, easy);
+        if (!resp.data || resp.size == 0) {
+            if (resp.data) { free(resp.data); resp.data = NULL; resp.size = 0; }
+            /* release active */
+            pthread_mutex_lock(&ctrl.active_lock);
+            ctrl.active--;
+            pthread_mutex_unlock(&ctrl.active_lock);
+            /* check termination */
+            pthread_mutex_lock(&ctrl.queue.lock);
+            int empty = (ctrl.queue.head == NULL);
+            pthread_mutex_unlock(&ctrl.queue.lock);
+            if (empty && ctrl.active == 0) set_stop_flag(1);
             continue;
         }
 
-        // Extract links into a temporary list
-        UrlNode* links = NULL;
-        extract_links(resp.data, &links);
-
-        // For each extracted link, normalize & enqueue if not visited
-        for (UrlNode* ln = links; ln != NULL; ln = ln->next) {
-            char full[MaxUrlLength];
-            build_full_url(origin, ln->url, full, sizeof(full));
-
-            // simple normalization: remove trailing '#' fragments (very small)
-            char* hash = strchr(full, '#');
-            if (hash) *hash = '\0';
-
-            if (!visited_contains(&visited, full)) {
-                // create a new node for BFS
-                UrlNode* child = malloc(sizeof(UrlNode));
-                if (!child) continue;
-                strncpy(child->url, full, MaxUrlLength - 1);
-                child->url[MaxUrlLength - 1] = '\0';
-                child->depth = cur->depth + 1;
-                child->parent = cur; // important: parent link for Path_print
-                child->next = NULL;
-                queue_push(&queue, child);
-                visited_insert(&visited, child->url);
+        /* get effective URL (after redirects) and compare canonical titles */
+        char *effective = NULL;
+        curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &effective);
+        if (effective) {
+            char eff_copy[MaxUrlLength];
+            strncpy(eff_copy, effective, MaxUrlLength-1); eff_copy[MaxUrlLength-1] = '\0';
+            canonicalize_url(eff_copy);
+            char eff_title[MaxUrlLength];
+            if (wiki_title_from_url(eff_copy, eff_title, sizeof(eff_title))) {
+                if (strcmp(eff_title, ctrl.target_title) == 0) {
+                    /* found target */
+                    mark_found(cur);
+                    free(resp.data);
+                    break;
+                }
             }
         }
+
+        /* extract links */
+        UrlNode *links = NULL;
+        extract_links(resp.data, &links);
+
+        /* For each link: normalize, same-origin check, visited check, enqueue */
+        for (UrlNode *ln = links; ln != NULL; ln = ln->next) {
+            char full[MaxUrlLength];
+            build_full_url(ctrl.origin, ln->url, full, sizeof(full));
+            canonicalize_url(full);
+
+            /* only follow same origin (e.g., https://en.wikipedia.org) */
+            if (strncmp(full, ctrl.origin, strlen(ctrl.origin)) != 0) continue;
+
+            /* check discovered title for quick match */
+            char title[MaxUrlLength];
+            if (wiki_title_from_url(full, title, sizeof(title))) {
+                if (strcmp(title, ctrl.target_title) == 0) {
+                    /* found by link before fetching */
+                    UrlNode *found = malloc(sizeof(UrlNode));
+                    if (found) {
+                        memset(found, 0, sizeof(UrlNode));
+                        strncpy(found->url, full, MaxUrlLength-1);
+                        found->depth = cur->depth + 1;
+                        found->parent = cur;
+                    }
+                    mark_found(found ? found : cur);
+                    break;
+                }
+            }
+
+            /* enqueue if not visited */
+            if (!visited_contains(&ctrl.visited, full)) {
+                UrlNode *child = malloc(sizeof(UrlNode));
+                if (!child) continue;
+                memset(child, 0, sizeof(UrlNode));
+                strncpy(child->url, full, MaxUrlLength-1);
+                child->depth = cur->depth + 1;
+                child->parent = cur;
+                child->next = NULL;
+                visited_insert(&ctrl.visited, child->url);
+                queue_push(&ctrl.queue, child);
+            }
+        } /* end for links */
 
         free_temp_links(links);
         free(resp.data);
 
-        // We free cur only if it's not the parent of any enqueued nodes that we need to keep the parent pointer for.
-        // In our simple design, child->parent points to cur; we must keep cur until either:
-        //  - it becomes the found node (in which case we stop and print), or
-        //  - there are no children that require cur (hard to detect). To keep things simple and safe for Path_print,
-        //    we will *not* free cur here so that parent pointers are valid if we find a later node that links back.
-        //    BUT to avoid memory leak explosion for the presentation, we free cur when its depth is well below max_depth.
-        // For simplicity in this demo, we won't free cur now (we'll let OS reclaim at program exit).
-        // If you want aggressive freeing you can implement reference counting.
+        /* Release active slot and check termination condition */
+        pthread_mutex_lock(&ctrl.active_lock);
+        ctrl.active--;
+        pthread_mutex_lock(&ctrl.queue.lock);
+        int empty = (ctrl.queue.head == NULL);
+        pthread_mutex_unlock(&ctrl.queue.lock);
+        if (empty && ctrl.active == 0 && !ctrl.found) set_stop_flag(1);
+        pthread_mutex_unlock(&ctrl.active_lock);
+
+        if (ctrl.found) break;
+    } /* end while */
+
+    curl_easy_cleanup(easy);
+    return NULL;
+}
+
+/* --------------------- Program entry --------------------- */
+void print_usage(const char *prog) {
+    fprintf(stderr, "USAGE: %s <start_url> <finish_url> <max_depth> [num_threads] [max_pages]\n", prog);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "-h") == 0) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (argc < 4) {
+        print_usage(argv[0]);
+        return 1;
     }
 
-    if (found_node) {
+    const char *start_url = argv[1];
+    const char *finish_url = argv[2];
+    int max_depth = atoi(argv[3]);
+    int num_threads = (argc >= 5) ? atoi(argv[4]) : DEFAULT_THREADS;
+    int max_pages = (argc >= 6) ? atoi(argv[5]) : DEFAULT_MAX_PAGES;
+    if (num_threads <= 0) num_threads = DEFAULT_THREADS;
+    if (max_depth < 0) max_depth = 0;
+
+    /* initialize controller */
+    memset(&ctrl, 0, sizeof(ctrl));
+    queue_init(&ctrl.queue);
+    visited_init(&ctrl.visited);
+    pthread_mutex_init(&ctrl.pages_lock, NULL);
+    pthread_mutex_init(&ctrl.found_lock, NULL);
+    pthread_mutex_init(&ctrl.stop_lock, NULL);
+    pthread_mutex_init(&ctrl.active_lock, NULL);
+
+    ctrl.max_depth = max_depth;
+    ctrl.max_pages = max_pages;
+    ctrl.pages_visited = 0;
+    ctrl.found = 0;
+    ctrl.found_node = NULL;
+    ctrl.should_stop = 0;
+    ctrl.active = 0;
+
+    /* build origin from start_url: scheme://host */
+    {
+        char tmp[MaxUrlLength];
+        strncpy(tmp, start_url, MaxUrlLength-1);
+        tmp[MaxUrlLength-1] = '\0';
+        char *p = strstr(tmp, "://");
+        if (p) {
+            p += 3;
+            char *slash = strchr(p, '/');
+            if (slash) *slash = '\0';
+        }
+        /* tmp now "scheme://host" or original if no scheme */
+        strncpy(ctrl.origin, tmp, MaxUrlLength-1);
+        ctrl.origin[MaxUrlLength-1] = '\0';
+    }
+
+    /* canonicalize finish and extract target title */
+    char target_copy[MaxUrlLength];
+    strncpy(target_copy, finish_url, MaxUrlLength-1);
+    target_copy[MaxUrlLength-1] = '\0';
+    canonicalize_url(target_copy);
+    if (!wiki_title_from_url(target_copy, ctrl.target_title, sizeof(ctrl.target_title))) {
+        fprintf(stderr, "Target must be a /wiki/ page: %s\n", finish_url);
+        return 1;
+    }
+
+    /* libcurl global init */
+    if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+        fprintf(stderr, "curl_global_init failed\n");
+        return 1;
+    }
+
+    /* push start node */
+    UrlNode *start = malloc(sizeof(UrlNode));
+    if (!start) { fprintf(stderr, "malloc failed\n"); return 1; }
+    memset(start, 0, sizeof(UrlNode));
+    strncpy(start->url, start_url, MaxUrlLength-1);
+    start->url[MaxUrlLength-1] = '\0';
+    start->depth = 0;
+    start->parent = NULL;
+    visited_insert(&ctrl.visited, start->url);
+    queue_push(&ctrl.queue, start);
+
+    /* create worker threads */
+    pthread_t *tids = malloc(sizeof(pthread_t) * num_threads);
+    if (!tids) { fprintf(stderr, "malloc failed\n"); return 1; }
+    for (int i = 0; i < num_threads; ++i) {
+        if (pthread_create(&tids[i], NULL, worker_main, NULL) != 0) {
+            fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
+            set_stop_flag(1);
+        }
+    }
+
+    /* wait for workers to finish */
+    for (int i = 0; i < num_threads; ++i) {
+        pthread_join(tids[i], NULL);
+    }
+    free(tids);
+
+    /* result */
+    if (ctrl.found && ctrl.found_node) {
         printf("Found target URL. Reconstructing path:\n");
-        Path_print(found_node);
-    }
-    else {
-        printf("Target URL not found within depth %d (pages visited: %d)\n", max_depth, pages_visited);
+        Path_print(ctrl.found_node);
+    } else {
+        printf("Target not found within depth %d (pages visited: %d)\n", ctrl.max_depth, ctrl.pages_visited);
     }
 
-    // Note: For simplicity we don't free all outstanding queue nodes and visited table on exit.
-    // The OS will reclaim memory on program termination. For production code, free everything.
-
+    curl_global_cleanup();
     return 0;
 }
