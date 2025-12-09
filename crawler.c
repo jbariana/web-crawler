@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
+#include <curl/curl.h> // added curl for HTTP requests
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -19,6 +20,7 @@
 
 typedef struct {
     UrlNode *head;
+    UrlNode *tail;
     UrlNode *tail;
     int size;
     pthread_mutex_t lock;
