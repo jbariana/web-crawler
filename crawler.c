@@ -6,11 +6,11 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <errno.h>
-#include "path.h" // provides UrlNode and MaxUrlLength
+#include "path.h"
 
 /* Tunable */
 #define VISITED_BUCKETS 8192
-#define DEFAULT_THREADS 4
+#define DEFAULT_THREADS 8
 #define DEFAULT_MAX_PAGES 10000
 
 /* --------------------- HTTP helper --------------------- */
@@ -500,7 +500,6 @@ int main(int argc, char **argv) {
             char *slash = strchr(p, '/');
             if (slash) *slash = '\0';
         }
-        /* tmp now "scheme://host" or original if no scheme */
         strncpy(ctrl.origin, tmp, MaxUrlLength-1);
         ctrl.origin[MaxUrlLength-1] = '\0';
     }
